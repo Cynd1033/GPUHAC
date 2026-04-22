@@ -1,27 +1,6 @@
 #include "cuda.h"
 #include <cassert>
-
-
-// temporary structures before I build actual I/O
-constexpr uint8_t kBlue = 1;
-constexpr uint8_t kRed  = 2;
-constexpr uint8_t kInactive = 0;
-
-struct GraphCSR {
-  int n;           // num vertices
-  int m;           // num edges (directed, so 2x undirected)
-  int*   row_ptr;  // length n+1
-  int*   col_idx;  // length m
-  float* weights;  // length m
-};
-
-struct ClusterState {
-  int*   parent;       // length n, parent[i]==i means i is a root
-  int*   cluster_size; // length n, valid at roots
-  uint8_t* color;      // length n, 0=inactive, 1=blue, 2=red
-  int*   merge_target; // length n, scratch per inner round
-  bool*  active;      
-};
+#include "gpuhac_naive_types.h"
 
 __device__ int find(int* parent, int v) {
   while (parent[v] != v) {
@@ -30,6 +9,7 @@ __device__ int find(int* parent, int v) {
   }
   return v;
 }
+
 
 __device__ void union_clusters(int* parent, int* cluster_size, int u, int v) {
   assert(parent[u] == u && parent[v] == v); // need these to be roots
@@ -89,6 +69,7 @@ __global__ void build_triples_kernel(GraphCSR G,
 				     ClusterState CS,
 				     int* out_red,
 				     float* out_priority,
+				     float* out_weight, // for tracking weight through merges
 				     unsigned long long seed,
 				     int n)
 {
@@ -125,13 +106,14 @@ __global__ void build_triples_kernel(GraphCSR G,
     if (CS.color[root_j] == kRed) {
       if (cur == chosen_idx) {
 	out_red[i] = root_j;
+	out_weight[i] = G.weights[e] / (CS.cluster_size[i] * CS.cluster_size[root_j]);
 	break;
       }
       cur++;
     }
   }
 
-  unsigned int h2 = hash_uint((unsigned int)(seed ^ i ^ 0xcynd1033));
+  unsigned int h2 = hash_uint((unsigned int)(seed ^ i ^ 0xdeadbeef));
   out_priority[i] = (float)h2 / (float)UINT_MAX;
 }
 
@@ -159,7 +141,7 @@ __global__ void prefix_select_kernel(ClusterState CS,
       out_merge_target[b] = r;
       accumulated += b_size;
     } else {
-      break;  // sorted by priority, so no point continuing
+      break;
     }
   }
 }
