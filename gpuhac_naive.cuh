@@ -11,7 +11,7 @@ __device__ int find(int* parent, int v) {
 }
 
 
-__device__ void union_clusters(int* parent, int* cluster_size, int u, int v) {
+/*__device__ void union_clusters(int* parent, int* cluster_size, int u, int v) {
   assert(parent[u] == u && parent[v] == v); // need these to be roots
   
   if (cluster_size[u] < cluster_size[v]) {
@@ -21,9 +21,10 @@ __device__ void union_clusters(int* parent, int* cluster_size, int u, int v) {
   atomicExch(&parent[v], u);
   atomicAdd(&cluster_size[u], cluster_size[v]);
 }
-
+*/
 
 // helper for compute_max_weight_kernel to work w/ floats
+// only works for positive floats. fine for weights?
 __device__ void atomicMaxFloat(float* addr, float val) {
   atomicMax((int*)addr, __float_as_int(val));
 }
@@ -31,7 +32,6 @@ __device__ void atomicMaxFloat(float* addr, float val) {
 __global__ void compute_max_weight_kernel(GraphCSR G, ClusterState CS, float* out_max_weight)  {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= G.n) return;
-  if (!CS.active[i]) return;
 
   int root_i = find(CS.parent, i);
   float local_max = 0.0f;
@@ -45,7 +45,7 @@ __global__ void compute_max_weight_kernel(GraphCSR G, ClusterState CS, float* ou
     if (w > local_max) local_max = w;
   }
 
-  atomicMaxFloat(out_max_weight, local_max);
+  if (local_max > 0.0f) atomicMaxFloat(out_max_weight, local_max);
 }
 
 // integer scramble helper for nearly-random coloring (might change to something else)
@@ -65,57 +65,39 @@ __global__ void color_vertices_kernel(ClusterState CS, unsigned long long seed, 
   CS.color[i] = (h & 1) ? kRed : kBlue;
 }
 
+// out_red should be init to INT_MAX -> INT_MAX values means no red neighbor found
 __global__ void build_triples_kernel(GraphCSR G,
 				     ClusterState CS,
 				     int* out_red,
 				     float* out_priority,
-				     float* out_weight, // for tracking weight through merges
 				     unsigned long long seed,
 				     int n)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  if (!CS.active[i]) return;
-  if (CS.color[i] != kBlue) return;
-
-  int num_red = 0;
+  if (i >= G.n) return;
+  
+  int root_i = find(CS.parent, i);
+  if (CS.color[root_i] != kBlue) return;
+  
   for (int e = G.row_ptr[i]; e < G.row_ptr[i+1]; e++) {
     int j = G.col_idx[e];
     int root_j = find(CS.parent, j);
-    if (root_j == i) continue;  
+    if (root_j == root_i) continue; // same cluster
     if (!CS.active[root_j]) continue;
-    if (CS.color[root_j] == kRed) num_red++;
+    if (CS.color[root_j] != kRed) continue;
+    
+    // maybe a race. handles deterministically
+    atomicMin(&out_red[root_i], root_j);
+    
+    // benign write race
+    out_priority[root_i] =
+      (float)hash_uint((unsigned int)(seed ^ (unsigned)root_i ^ 0xdeadbeef))
+      / (float)UINT_MAX;
+    
+    break; // this thread found a red; potential race handled by atomicMin
   }
-
-  if (num_red == 0) {
-    out_red[i] = -1;
-    return;
-  }
-
-  unsigned int h1 = hash_uint((unsigned int)(seed ^ i));
-  int chosen_idx = h1 % num_red;
-
-  // this double pass is terrible
-  // TODO: fix w/ resevoir sampling
-  int cur = 0;
-  for (int e = G.row_ptr[i]; e < G.row_ptr[i+1]; e++) {
-    int j = G.col_idx[e];
-    int root_j = find(CS.parent, j);
-    if (root_j == i) continue;
-    if (!CS.active[root_j]) continue;
-    if (CS.color[root_j] == kRed) {
-      if (cur == chosen_idx) {
-	out_red[i] = root_j;
-	out_weight[i] = G.weights[e] / (CS.cluster_size[i] * CS.cluster_size[root_j]);
-	break;
-      }
-      cur++;
-    }
-  }
-
-  unsigned int h2 = hash_uint((unsigned int)(seed ^ i ^ 0xdeadbeef));
-  out_priority[i] = (float)h2 / (float)UINT_MAX;
 }
+
 
 __global__ void prefix_select_kernel(ClusterState CS,
 				     int* sorted_blue,
@@ -165,11 +147,7 @@ __global__ void apply_merges_kernel(ClusterState CS,
   int r = merge_target[i];
   if (r == -1) return;
   
-  // both should be roots
-  assert(CS.parent[i] == i);
-  assert(CS.parent[r] == r);
-  
-  union_clusters(CS.parent, CS.cluster_size, i, r);
+  union_into(CS.parent, CS.cluster_size, i, r);
 
   // blue merged into red, mark blue as inactive
   CS.active[i] = false;
