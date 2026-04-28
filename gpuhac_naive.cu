@@ -29,7 +29,7 @@ static dim3 blocks1d(int n, int threads = 256) {
   return dim3((n + threads - 1) / threads);
 }
 
-std::vector<MergeEvent> ParHAC_naive(int n,
+std::vector<MergeEvent> gpuhac_naive(int n,
 				     int m,
 				     int* h_row_ptr,
 				     int* h_col_idx,
