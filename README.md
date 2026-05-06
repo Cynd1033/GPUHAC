@@ -1,1 +1,1 @@
-GPU hierarchical agglomerative clustering. WIP
+GPU average linkage based hierarchical agglomerative clustering. WIP
