@@ -68,6 +68,13 @@ std::vector<MergeEvent> gpuhac_naive(int n,
   cudaMalloc(&d_max_weight,  sizeof(float));
   cudaMalloc(&d_out_red,      n * sizeof(int));
   cudaMalloc(&d_out_priority, n * sizeof(float));
+
+  // used to be in inner loop, but allocating beforehand saves lots of frees
+  thrust::device_vector<int> d_blue_idx(n);
+  thrust::device_vector<int> d_sorted_reds(n);
+  thrust::device_vector<int> d_red_roots(n);
+  thrust::device_vector<int> d_red_counts(n);
+  thrust::device_vector<int> d_red_offsets(n + 1);
   
   // Output
   std::vector<MergeEvent> dendrogram;
@@ -114,7 +121,6 @@ std::vector<MergeEvent> gpuhac_naive(int n,
       build_triples_kernel<<<vertex_blocks, threads>>>(G, CS, d_out_red, d_out_priority, seed++, n);
       
       // Filter to blue vertices that found a red neighbor
-      thrust::device_vector<int> d_blue_idx(n);
       int num_valid = thrust::copy_if(
 				      thrust::device,
 				      thrust::make_counting_iterator(0),
@@ -125,8 +131,6 @@ std::vector<MergeEvent> gpuhac_naive(int n,
 				      }
 				      ) - d_blue_idx.begin();
       
-      d_blue_idx.resize(num_valid);
-      
       if (num_valid == 0) break;
       
       // Sort blue indices by (chosen red root, priority)
@@ -135,7 +139,7 @@ std::vector<MergeEvent> gpuhac_naive(int n,
       thrust::sort(
 		   thrust::device,
 		   d_blue_idx.begin(),
-		   d_blue_idx.end(),
+		   d_blue_idx.begin() + num_valid,
 		   [d_out_red      = d_out_red,
 		    d_out_priority = d_out_priority] __device__ (int a, int b) {
 		     if (d_out_red[a] != d_out_red[b])
@@ -146,6 +150,32 @@ std::vector<MergeEvent> gpuhac_naive(int n,
       
       // Compute per-red group offsets via reduce_by_key + exclusive_scan
       // d_sorted_reds[i] = the red root chosen by d_blue_idx[i]
+      thrust::transform(
+			thrust::device,
+			d_blue_idx.begin(), d_blue_idx.begin() + num_valid,
+			d_sorted_reds.begin(),
+			[d_out_red = d_out_red] __device__ (int i) { return d_out_red[i]; }
+			);
+
+      int num_red = thrust::reduce_by_key(
+					  thrust::device,
+					  d_sorted_reds.begin(), d_sorted_reds.begin() + num_valid,
+					  thrust::make_constant_iterator(1),
+					  d_red_roots.begin(),
+					  d_red_counts.begin()
+					  ).first - d_red_roots.begin();
+
+      // no resize
+
+      thrust::exclusive_scan(
+			     thrust::device,
+			     d_red_counts.begin(), d_red_counts.begin() + num_red,
+			     d_red_offsets.begin(),
+			     0
+			     );
+      d_red_offsets[num_red] = num_valid;  // sentinel
+      
+      /*
       thrust::device_vector<int> d_sorted_reds(num_valid);
       thrust::transform(
 			thrust::device,
@@ -175,6 +205,7 @@ std::vector<MergeEvent> gpuhac_naive(int n,
 			     0
 			     );
       d_red_offsets[num_red] = num_valid;  // sentinel
+      */
       
       // Prefix select: each red picks the largest prefix of its blues
       // such that total absorbed size <= (1+eps) * red_size
